@@ -369,7 +369,7 @@ func (e *Environment) ensureImageExists(img string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	registry, registryAuth := config.Get().Docker.RegistryCredentialsForImage(img)
+	registry, registryAuth := config.CredentialsForImage(img, e.Config().RegistryCredentials())
 	if registryAuth != nil {
 		log.WithField("registry", registry).Debug("using authentication for registry")
 	}

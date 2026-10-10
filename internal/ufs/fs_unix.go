@@ -790,6 +790,17 @@ func (fs *UnixFS) SafePath(path string) (int, string, func(), error) {
 	return fs.safePath(path)
 }
 
+// RelPath returns the location of path relative to the base path, using the exact
+// normalization that every operation on the UnixFS applies. The result is "." for the
+// base path itself and never begins with a slash or contains "..". An error of type
+// *PathError is returned if the path does not refer to a location inside the base path.
+//
+// Callers that check a path against rules must use this, rather than normalizing the path
+// themselves, so that the check and the operation always refer to the same location.
+func (fs *UnixFS) RelPath(path string) (string, error) {
+	return fs.unsafePath(path)
+}
+
 func (fs *UnixFS) safePath(path string) (dirfd int, file string, closeFd func(), err error) {
 	// Default closeFd to a NO-OP.
 	closeFd = func() {}

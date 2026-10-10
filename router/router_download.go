@@ -89,7 +89,7 @@ func getDownloadFile(c *gin.Context) {
 		return
 	}
 
-	f, st, err := s.Filesystem().File(token.FilePath)
+	f, st, err := s.Filesystem().Restricted().File(token.FilePath)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return

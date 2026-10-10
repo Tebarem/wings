@@ -253,7 +253,7 @@ func (ip *InstallationProcess) writeScriptToDisk() error {
 
 // Pulls the docker image to be used for the installation container.
 func (ip *InstallationProcess) pullInstallationImage() error {
-	registry, registryAuth := config.Get().Docker.RegistryCredentialsForImage(ip.Script.ContainerImage)
+	registry, registryAuth := config.CredentialsForImage(ip.Script.ContainerImage, ip.Server.RegistryCredentials())
 	if registryAuth != nil {
 		log.WithField("registry", registry).Debug("using authentication for registry")
 	}

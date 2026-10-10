@@ -196,7 +196,8 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		return nil, errors.WithStackIf(err)
 	}
 
-	s.fs, err = filesystem.New(filepath.Join(config.Get().System.Data, s.ID()), s.DiskSpace(), s.Config().Egg.FileDenylist)
+	egg := s.Config().Egg
+	s.fs, err = filesystem.New(filepath.Join(config.Get().System.Data, s.ID()), s.DiskSpace(), egg.FileHidden, egg.FileDenylist)
 	if err != nil {
 		return nil, errors.WithStackIf(err)
 	}
@@ -205,10 +206,11 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 	// this logic in. When we're ready to support other environment we'll need to make
 	// some modifications here, obviously.
 	settings := environment.Settings{
-		Mounts:      s.Mounts(),
-		Allocations: s.cfg.Allocations,
-		Limits:      s.cfg.Build,
-		Labels:      s.cfg.Labels,
+		Mounts:       s.Mounts(),
+		Allocations:  s.cfg.Allocations,
+		Limits:       s.cfg.Build,
+		Labels:       s.cfg.Labels,
+		RegistryAuth: s.RegistryCredentials(),
 	}
 
 	envCfg := environment.NewConfiguration(settings, s.GetEnvironmentVariables())

@@ -15,7 +15,6 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gabriel-vasile/mimetype"
-	ignore "github.com/sabhiram/go-gitignore"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/internal/ufs"
@@ -28,13 +27,20 @@ type Filesystem struct {
 	lastLookupTime    *usageLookupTime
 	lookupInProgress  atomic.Bool
 	diskCheckInterval time.Duration
-	denylist          *ignore.GitIgnore
+	// rules holds the hidden and protected file rules that apply to user-facing
+	// access. Internal operations on the Filesystem do not consult them.
+	rules *fileRules
+
+	// realBase is the root directory with every symbolic link in its path resolved. The
+	// canonical locations found while accessing files are relative to it.
+	realBase string
 
 	isTest bool
 }
 
-// New creates a new Filesystem instance for a given server.
-func New(root string, size int64, denylist []string) (*Filesystem, error) {
+// New creates a new Filesystem instance for a given server. The hidden and protected
+// lists are gitignore-style patterns matched against paths relative to the server root.
+func New(root string, size int64, hidden, protected []string) (*Filesystem, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
@@ -44,13 +50,29 @@ func New(root string, size int64, denylist []string) (*Filesystem, error) {
 	}
 	quota := ufs.NewQuota(unixFS, size)
 
+	realBase, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Filesystem{
 		unixFS: quota,
 
 		diskCheckInterval: time.Duration(config.Get().System.DiskCheckInterval),
 		lastLookupTime:    &usageLookupTime{},
-		denylist:          ignore.CompileIgnoreLines(denylist...),
+		rules:             newFileRules(hidden, protected),
+		realBase:          realBase,
 	}, nil
+}
+
+// SetRules replaces the hidden and protected file rules. This is called whenever the
+// server configuration is synced with the Panel so that changes to the egg apply.
+//
+// Checks that run concurrently with a change see either the old or the new rules, never a
+// mix of them, because the rules are swapped under a lock. A check that started before the
+// change may still complete with the old rules, which is acceptable for a rule change.
+func (fs *Filesystem) SetRules(hidden, protected []string) {
+	fs.rules.set(hidden, protected)
 }
 
 // Path returns the root path for the Filesystem instance.
@@ -306,7 +328,7 @@ func (fs *Filesystem) Chmod(path string, mode ufs.FileMode) error {
 // Could probably make this more efficient by checking if there are any files matching the copy
 // pattern, and trying to find the highest number and then incrementing it by one rather than
 // looping endlessly.
-func (fs *Filesystem) findCopySuffix(dirfd int, name, extension string) (string, error) {
+func (fs *Filesystem) findCopySuffix(dirfd int, name, extension string, taken func(string) bool) (string, error) {
 	var i int
 	suffix := " copy"
 
@@ -318,11 +340,14 @@ func (fs *Filesystem) findCopySuffix(dirfd int, name, extension string) (string,
 		n := name + suffix + extension
 		// If we stat the file and it does not exist that means we're good to create the copy. If it
 		// does exist, we'll just continue to the next loop and try again.
-		if _, err := fs.unixFS.Lstatat(dirfd, n); err != nil {
-			if !errors.Is(err, ufs.ErrNotExist) {
-				return "", err
+		// A name that is restricted counts as taken, so that a copy never lands on a restricted name.
+		if taken == nil || !taken(n) {
+			if _, err := fs.unixFS.Lstatat(dirfd, n); err != nil {
+				if !errors.Is(err, ufs.ErrNotExist) {
+					return "", err
+				}
+				break
 			}
-			break
 		}
 
 		if i == 50 {
@@ -374,7 +399,7 @@ func (fs *Filesystem) Copy(p string) error {
 		baseName = strings.TrimSuffix(baseName, ".tar")
 	}
 
-	newName, err := fs.findCopySuffix(dirfd, baseName, extension)
+	newName, err := fs.findCopySuffix(dirfd, baseName, extension, nil)
 	if err != nil {
 		return err
 	}
@@ -460,10 +485,10 @@ func (fs *Filesystem) Delete(p string) error {
 func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 	// Read entries from the path on the filesystem, using the mapped reader, so
 	// we can map the DirEntry slice into a Stat slice with mimetype information.
-	out, err := ufs.ReadDirMap(fs.unixFS.UnixFS, p, func(e ufs.DirEntry) (Stat, error) {
+	mapped, err := ufs.ReadDirMap(fs.unixFS.UnixFS, p, func(e ufs.DirEntry) (*Stat, error) {
 		info, err := e.Info()
 		if err != nil {
-			return Stat{}, err
+			return nil, err
 		}
 
 		var d string
@@ -480,7 +505,7 @@ func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 			})
 			f, err := eO.Open()
 			if err != nil {
-				return Stat{}, err
+				return nil, err
 			}
 			m, err = mimetype.DetectReader(f)
 			if err != nil {
@@ -493,10 +518,17 @@ func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 		if m != nil {
 			st.Mimetype = m.String()
 		}
-		return st, nil
+		return &st, nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	out := make([]Stat, 0, len(mapped))
+	for _, st := range mapped {
+		if st != nil {
+			out = append(out, *st)
+		}
 	}
 
 	// Sort entries alphabetically.

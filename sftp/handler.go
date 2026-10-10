@@ -104,15 +104,35 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	f, _, err := h.fs.File(request.Filepath)
+	f, _, err := h.restricted().File(request.Filepath)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			h.logger.WithField("error", err).Error("error processing readfile request")
-			return nil, sftp.ErrSSHFxFailure
+		if rerr := restrictionError(err); rerr != nil {
+			return nil, rerr
 		}
-		return nil, sftp.ErrSSHFxNoSuchFile
+		h.logger.WithField("error", err).Error("error processing readfile request")
+		return nil, sftp.ErrSSHFxFailure
 	}
 	return f, nil
+}
+
+// restricted returns the view of the filesystem that SFTP clients are allowed to use.
+func (h *Handler) restricted() *filesystem.Restricted {
+	return h.fs.Restricted()
+}
+
+// restrictionError returns the SFTP status for an error caused by the file rules, or nil
+// if err was not caused by them. Hidden files are reported as not existing, and protected
+// files as permission denied.
+func restrictionError(err error) error {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return sftp.ErrSSHFxNoSuchFile
+	case filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile),
+		filesystem.IsErrorCode(err, filesystem.ErrCodeHardlink),
+		filesystem.IsErrorCode(err, filesystem.ErrCodeRestrictedContents):
+		return sftp.ErrSSHFxPermissionDenied
+	}
+	return nil
 }
 
 // Filewrite handles the write actions for a file on the system.
@@ -132,7 +152,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	// The specific permission required to perform this action. If the file exists on the
 	// system already it only needs to be an update, otherwise we'll check for a create.
 	permission := PermissionFileUpdate
-	_, sterr := h.fs.Stat(request.Filepath)
+	_, sterr := h.restricted().Stat(request.Filepath)
 	if sterr != nil {
 		if !errors.Is(sterr, os.ErrNotExist) {
 			l.WithField("error", sterr).Error("error while getting file reader")
@@ -146,14 +166,17 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	f, err := h.restricted().Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
 	if err != nil {
+		if rerr := restrictionError(err); rerr != nil {
+			return nil, rerr
+		}
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
 	}
 	// Chown may or may not have been called in the touch function, so always do
 	// it at this point to avoid the file being improperly owned.
-	_ = h.fs.Chown(request.Filepath)
+	_ = h.restricted().Chown(request.Filepath)
 	event := server.ActivitySftpWrite
 	if permission == PermissionFileCreate {
 		event = server.ActivitySftpCreate
@@ -207,9 +230,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return sftp.ErrSSHFxNoSuchFile
+		if err := h.restricted().Chmod(request.Filepath, mode); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
 			}
 			l.WithField("error", err).Error("failed to perform setstat on item")
 			return sftp.ErrSSHFxFailure
@@ -220,9 +243,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Rename(request.Filepath, request.Target); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return sftp.ErrSSHFxNoSuchFile
+		if err := h.restricted().Rename(request.Filepath, request.Target); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
 			}
 			l.WithField("error", err).Error("failed to rename file")
 			return sftp.ErrSSHFxFailure
@@ -237,7 +260,10 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxPermissionDenied
 		}
 		p := filepath.Clean(request.Filepath)
-		if err := h.fs.Delete(p); err != nil {
+		if err := h.restricted().Delete(p); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
+			}
 			l.WithField("error", err).Error("failed to remove directory")
 			return sftp.ErrSSHFxFailure
 		}
@@ -250,7 +276,10 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		}
 		name := strings.Split(filepath.Clean(request.Filepath), "/")
 		p := strings.Join(name[0:len(name)-1], "/")
-		if err := h.fs.CreateDirectory(name[len(name)-1], p); err != nil {
+		if err := h.restricted().CreateDirectory(name[len(name)-1], p); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
+			}
 			l.WithField("error", err).Error("failed to create directory")
 			return sftp.ErrSSHFxFailure
 		}
@@ -262,7 +291,10 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileCreate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Symlink(request.Filepath, request.Target); err != nil {
+		if err := h.restricted().Symlink(request.Filepath, request.Target); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
+			}
 			l.WithField("target", request.Target).WithField("error", err).Error("failed to create symlink")
 			return sftp.ErrSSHFxFailure
 		}
@@ -272,9 +304,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileDelete) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Delete(request.Filepath); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return sftp.ErrSSHFxNoSuchFile
+		if err := h.restricted().Delete(request.Filepath); err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return rerr
 			}
 			l.WithField("error", err).Error("failed to remove a file")
 			return sftp.ErrSSHFxFailure
@@ -292,7 +324,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 	// Not failing here is intentional. We still made the file, it is just owned incorrectly
 	// and will likely cause some issues. There is no logical check for if the file was removed
 	// because both of those cases (Rmdir, Remove) have an explicit return rather than break.
-	if err := h.fs.Chown(target); err != nil {
+	if err := h.restricted().Chown(target); err != nil {
 		l.WithField("error", err).Warn("error chowning file")
 	}
 
@@ -308,17 +340,20 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 
 	switch request.Method {
 	case "List":
-		entries, err := h.fs.ReadDirStat(request.Filepath)
+		entries, err := h.restricted().ReadDirStat(request.Filepath)
 		if err != nil {
+			if rerr := restrictionError(err); rerr != nil {
+				return nil, rerr
+			}
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error while listing directory")
 			return nil, sftp.ErrSSHFxFailure
 		}
 		return ListerAt(entries), nil
 	case "Stat":
-		st, err := h.fs.Stat(request.Filepath)
+		st, err := h.restricted().Stat(request.Filepath)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, sftp.ErrSSHFxNoSuchFile
+			if rerr := restrictionError(err); rerr != nil {
+				return nil, rerr
 			}
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error performing stat on file")
 			return nil, sftp.ErrSSHFxFailure

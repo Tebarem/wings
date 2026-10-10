@@ -31,7 +31,7 @@ import (
 func getServerFileContents(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	p := strings.TrimLeft(c.Query("file"), "/")
-	f, st, err := s.Filesystem().File(p)
+	f, st, err := s.Filesystem().Restricted().File(p)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -78,7 +78,7 @@ func getServerFileContents(c *gin.Context) {
 func getServerListDirectory(c *gin.Context) {
 	s := ExtractServer(c)
 	dir := c.Query("directory")
-	if stats, err := s.Filesystem().ListDirectory(dir); err != nil {
+	if stats, err := s.Filesystem().Restricted().ListDirectory(dir); err != nil {
 		middleware.CaptureAndAbort(c, err)
 	} else {
 		c.JSON(http.StatusOK, stats)
@@ -121,12 +121,9 @@ func putServerRenameFiles(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				fs := s.Filesystem()
-				// Ignore renames on a file that is on the denylist (both as the rename from or
-				// the rename to value).
-				if err := fs.IsIgnored(pf, pt); err != nil {
-					return err
-				}
+				// Renames are refused for protected files, both as the source and as the
+				// destination. Hidden files are treated as if they do not exist.
+				fs := s.Filesystem().Restricted()
 				if err := fs.Rename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
 					if errors.Is(err, os.ErrNotExist) {
@@ -170,11 +167,7 @@ func postServerCopyFile(c *gin.Context) {
 		return
 	}
 
-	if err := s.Filesystem().IsIgnored(data.Location); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-	if err := s.Filesystem().Copy(data.Location); err != nil {
+	if err := s.Filesystem().Restricted().Copy(data.Location); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -214,7 +207,7 @@ func postServerDeleteFiles(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				return s.Filesystem().Delete(pi)
+				return s.Filesystem().Restricted().Delete(pi)
 			}
 		})
 	}
@@ -234,11 +227,6 @@ func postServerWriteFile(c *gin.Context) {
 	f := c.Query("file")
 	f = "/" + strings.TrimLeft(f, "/")
 
-	if err := s.Filesystem().IsIgnored(f); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
 	// A content length of -1 means the actual length is unknown.
 	if c.Request.ContentLength == -1 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -247,7 +235,7 @@ func postServerWriteFile(c *gin.Context) {
 		return
 	}
 
-	if err := s.Filesystem().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
+	if err := s.Filesystem().Restricted().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Cannot write file, name conflicts with an existing directory by the same name.",
@@ -367,7 +355,7 @@ func postServerPullRemoteFile(c *gin.Context) {
 		return
 	}
 
-	st, err := s.Filesystem().Stat(dl.Path())
+	st, err := s.Filesystem().Restricted().Stat(dl.Path())
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -397,7 +385,7 @@ func postServerCreateDirectory(c *gin.Context) {
 		return
 	}
 
-	if err := s.Filesystem().CreateDirectory(data.Name, data.Path); err != nil {
+	if err := s.Filesystem().Restricted().CreateDirectory(data.Name, data.Path); err != nil {
 		if err.Error() == "not a directory" {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Part of the path being created is not a directory (ENOTDIR).",
@@ -438,7 +426,7 @@ func postServerCompressFiles(c *gin.Context) {
 		return
 	}
 
-	f, err := s.Filesystem().CompressFiles(data.RootPath, data.Files)
+	f, err := s.Filesystem().Restricted().CompressFiles(data.RootPath, data.Files)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -465,7 +453,7 @@ func postServerDecompressFiles(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
 	lg.Debug("checking if space is available for file decompression")
-	err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
+	err := s.Filesystem().Restricted().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
 	if err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
 			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
@@ -477,7 +465,7 @@ func postServerDecompressFiles(c *gin.Context) {
 	}
 
 	lg.Info("starting file decompression")
-	if err := s.Filesystem().DecompressFile(context.Background(), data.RootPath, data.File); err != nil {
+	if err := s.Filesystem().Restricted().DecompressFile(context.Background(), data.RootPath, data.File); err != nil {
 		// If the file is busy for some reason just return a nicer error to the user since there is not
 		// much we specifically can do. They'll need to stop the running server process in order to overwrite
 		// a file like this.
@@ -535,7 +523,7 @@ func postServerChmodFile(c *gin.Context) {
 					return errInvalidFileMode
 				}
 
-				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
+				if err := s.Filesystem().Restricted().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
@@ -635,11 +623,7 @@ func handleFileUpload(p string, s *server.Server, header *multipart.FileHeader) 
 	}
 	defer file.Close()
 
-	if err := s.Filesystem().IsIgnored(p); err != nil {
-		return err
-	}
-
-	if err := s.Filesystem().Write(p, file, header.Size, 0o644); err != nil {
+	if err := s.Filesystem().Restricted().Write(p, file, header.Size, 0o644); err != nil {
 		return err
 	}
 	return nil

@@ -25,10 +25,11 @@ func (s *Server) SyncWithEnvironment() {
 
 	// Update the environment settings using the new information from this server.
 	s.Environment.Config().SetSettings(environment.Settings{
-		Mounts:      s.Mounts(),
-		Allocations: cfg.Allocations,
-		Limits:      cfg.Build,
-		Labels:      cfg.Labels,
+		Mounts:       s.Mounts(),
+		Allocations:  cfg.Allocations,
+		Limits:       cfg.Build,
+		Labels:       cfg.Labels,
+		RegistryAuth: s.RegistryCredentials(),
 	})
 
 	// For Docker specific environments we also want to update the configured image

@@ -14,6 +14,8 @@ import (
 type Stat struct {
 	ufs.FileInfo
 	Mimetype string
+	// Protected is true when the file is visible to users but cannot be accessed through Wings.
+	Protected bool
 }
 
 func (s *Stat) MarshalJSON() ([]byte, error) {
@@ -28,6 +30,7 @@ func (s *Stat) MarshalJSON() ([]byte, error) {
 		File      bool   `json:"file"`
 		Symlink   bool   `json:"symlink"`
 		Mime      string `json:"mime"`
+		Protected bool   `json:"protected"`
 	}{
 		Name:     s.Name(),
 		Created:  s.CTime().Format(time.RFC3339),
@@ -40,6 +43,7 @@ func (s *Stat) MarshalJSON() ([]byte, error) {
 		File:      !s.IsDir(),
 		Symlink:   s.Mode().Type()&ufs.ModeSymlink != 0,
 		Mime:      s.Mimetype,
+		Protected: s.Protected,
 	})
 }
 

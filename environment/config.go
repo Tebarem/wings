@@ -2,6 +2,8 @@ package environment
 
 import (
 	"sync"
+
+	"github.com/pterodactyl/wings/config"
 )
 
 type Settings struct {
@@ -9,6 +11,11 @@ type Settings struct {
 	Allocations Allocations
 	Limits      Limits
 	Labels      map[string]string
+
+	// RegistryAuth holds the Docker registry credentials the Panel supplied for this
+	// server, keyed by registry (host or host/path). The map is replaced as a whole on
+	// every settings update and must never be modified in place.
+	RegistryAuth map[string]config.RegistryConfiguration
 }
 
 // Defines the actual configuration struct for the environment with all of the settings
@@ -83,4 +90,13 @@ func (c *Configuration) EnvironmentVariables() []string {
 	defer c.mu.RUnlock()
 
 	return c.environmentVariables
+}
+
+// RegistryCredentials returns the Docker registry credentials supplied for this
+// server. The returned map must be treated as read-only.
+func (c *Configuration) RegistryCredentials() map[string]config.RegistryConfiguration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.settings.RegistryAuth
 }

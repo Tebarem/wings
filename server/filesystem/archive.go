@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/internal/progress"
@@ -73,6 +76,14 @@ type Archive struct {
 
 	// Progress wraps the writer of the archive to pass through the progress tracker.
 	Progress *progress.Progress
+
+	// root is the verified canonical path of BaseDirectory for a restricted archive.
+	root string
+
+	// Restricted leaves hidden and protected files, and any directory that is hidden or
+	// protected, out of the archive. It is set for archives made on behalf of a user
+	// (and backups), where those files must never leave the server through Wings.
+	Restricted bool
 
 	w *TarProgress
 }
@@ -171,11 +182,31 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		callback = a.callback()
 	}
 
-	// Open the base directory we were provided.
-	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
-	defer closeFd()
-	if err != nil {
-		return err
+	// When restricted, the base directory is opened through a descriptor that has been checked
+	// against the rules, and entries are classified as they are walked, so restricted files and
+	// directories are skipped. Directories are skipped entirely, so their contents are never visited.
+	var (
+		dirfd      int
+		name       string
+		classifier *walkClassifier
+		err        error
+	)
+	if a.Restricted {
+		base, canonical, err := a.Filesystem.openDir(a.BaseDirectory)
+		if err != nil {
+			return err
+		}
+		defer base.Close()
+		dirfd, name = int(base.Fd()), "."
+		a.root = canonical
+		classifier = a.Filesystem.newWalkClassifier(canonical)
+	} else {
+		var closeFd func()
+		dirfd, name, closeFd, err = fs.SafePath(a.BaseDirectory)
+		defer closeFd()
+		if err != nil {
+			return err
+		}
 	}
 
 	// Recursively walk the base directory.
@@ -187,6 +218,18 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			if classifier != nil && relative != "." {
+				lvl, err := classifier.Classify(relative, d.IsDir(), d.Type()&ufs.ModeSymlink != 0)
+				if err != nil {
+					return err
+				}
+				if lvl != LevelNone {
+					if d.IsDir() {
+						return ufs.SkipDir
+					}
+					return nil
+				}
+			}
 			return callback(dirfd, name, relative, d)
 		}
 	})
@@ -269,6 +312,31 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed executing os.Lstat on '%s'", name)
 	}
 
+	// A file in a user archive is only included once the descriptor it is read from has been
+	// checked: it must still be where the walk found it, it must not be restricted, and it must
+	// not be reachable by another name. The file is opened before its header is written, so a
+	// file that fails the checks is skipped without leaving a broken entry in the archive.
+	var pre ufs.File
+	if a.Restricted && s.Mode().IsRegular() {
+		opened, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
+		if err != nil {
+			return nil
+		}
+		info, err := opened.Stat()
+		if err != nil {
+			_ = opened.Close()
+			return nil
+		}
+		if reason := a.skipReason(opened, info, relative); reason != "" {
+			log.WithField("path", relative).WithField("reason", reason).Debug("skipping file in user archive")
+			_ = opened.Close()
+			return nil
+		}
+		pre = opened
+		defer pre.Close()
+		s = info
+	}
+
 	// Skip socket files as they are unsupported by archive/tar.
 	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"
 	if s.Mode()&fs.ModeSocket != 0 {
@@ -282,7 +350,11 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		// the logs, but we're not going to stop the backup. There are far too many cases of
 		// symlinks causing all sorts of unnecessary pain in this process. Sucks to suck if
 		// it doesn't work.
-		target, err = os.Readlink(s.Name())
+		// The link is read relative to the directory the walk found it in, never relative to the
+		// working directory of Wings.
+		buf := make([]byte, unix.PathMax)
+		n, err := unix.Readlinkat(dirfd, name, buf)
+		target = string(buf[:n])
 		if err != nil {
 			// Ignore the not exist errors specifically, since there is nothing important about that.
 			if !os.IsNotExist(err) {
@@ -326,19 +398,43 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		}()
 	}
 
-	// Open the file.
-	f, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	// Open the file, unless it was already opened and checked above.
+	f := pre
+	if f == nil {
+		opened, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return errors.WrapIff(err, "failed to open '%s' for copying", header.Name)
 		}
-		return errors.WrapIff(err, "failed to open '%s' for copying", header.Name)
+		f = opened
+		defer f.Close()
 	}
-	defer f.Close()
 
 	// Copy the file's contents to the archive using our buffer.
 	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
 	return nil
+}
+
+// skipReason returns why an open file must not be included in a user archive, or an empty
+// string if it may be included. The file must still be where the walk found it, which is
+// checked on the descriptor, and it must not be restricted or reachable by another name.
+func (a *Archive) skipReason(f ufs.File, info ufs.FileInfo, relative string) string {
+	loc, err := a.Filesystem.fdPath(int(f.Fd()))
+	if err != nil {
+		return "outside of the server root"
+	}
+	if loc != path.Join(a.root, relative) {
+		return "moved while being archived"
+	}
+	if a.Filesystem.rules.levelAt(loc, kindFile) != LevelNone {
+		return "restricted"
+	}
+	if a.Filesystem.hardlinked(info) {
+		return "hard linked"
+	}
+	return ""
 }

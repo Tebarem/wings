@@ -60,6 +60,7 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
+		Restricted: true,
 	}
 
 	s.log().WithField("path", s.Path()).Info("creating backup for server")

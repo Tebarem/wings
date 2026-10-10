@@ -125,6 +125,15 @@ func (re *RequestError) asFilesystemError() (int, string) {
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile) || strings.Contains(err.Error(), "filesystem: file access prohibited") {
 		return http.StatusForbidden, "This file cannot be modified: present in egg denylist."
 	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeHardlink) {
+		return http.StatusForbidden, "Hardlinked files cannot be accessed on servers with protected files."
+	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeNotRegular) {
+		return http.StatusBadRequest, "Cannot perform that action: the file is not a regular file."
+	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeRestrictedContents) {
+		return http.StatusForbidden, "This directory contains files that cannot be modified."
+	}
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) || strings.Contains(err.Error(), "filesystem: is a directory") {
 		return http.StatusBadRequest, "Cannot perform that action: file is a directory."
 	}

@@ -132,7 +132,7 @@ func postServerRestoreBackup(c *gin.Context) {
 	logger.Info("processing server backup restore request")
 	if data.TruncateDirectory {
 		logger.Info("received \"truncate_directory\" flag in request: deleting server files")
-		if err := s.Filesystem().TruncateRootDirectory(); err != nil {
+		if err := s.Filesystem().Restricted().TruncateRootDirectory(); err != nil {
 			middleware.CaptureAndAbort(c, err)
 			return
 		}

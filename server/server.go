@@ -200,6 +200,10 @@ func (s *Server) Sync() error {
 	// it changes.
 	s.fs.SetDiskLimit(s.DiskSpace())
 
+	// Apply any changes to the egg's hidden and protected file rules.
+	egg := s.Config().Egg
+	s.fs.SetRules(egg.FileHidden, egg.FileDenylist)
+
 	s.SyncWithEnvironment()
 
 	// If the server is suspended immediately disconnect all open websocket connections

@@ -52,29 +52,22 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, e
 	return f.Stat()
 }
 
-func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, io.Closer, error) {
-	f, err := fs.unixFS.Open(p)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Do not use defer to close `f`, it will likely be used later.
-
-	format, _, err := archives.Identify(ctx, filepath.Base(p), f)
+// archiveFS returns a read-only view of the archive read from f. The file is rewound first,
+// and it is not closed, so the caller keeps ownership of it.
+func archiveFS(ctx context.Context, f ufs.File, name string) (iofs.FS, error) {
+	format, _, err := archives.Identify(ctx, filepath.Base(name), f)
 	if err != nil && !errors.Is(err, archives.NoMatch) {
-		_ = f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Reset the file reader.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
 	info, err := f.Stat()
 	if err != nil {
-		_ = f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
 	if format != nil {
@@ -84,20 +77,29 @@ func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS
 			// and zip.Reader can open several content files concurrently because of io.ReaderAt requirement
 			// while ArchiveFS can't.
 			// zip.Reader doesn't suffer from issue #330 and #310 according to local test (but they should be fixed anyway)
-			reader, err := zip.NewReader(f, info.Size())
-			if err != nil {
-				_ = f.Close()
-				return nil, nil, err
-			}
-			return reader, f, nil
+			return zip.NewReader(f, info.Size())
 		case archives.Extraction:
-			return &archives.ArchiveFS{Stream: io.NewSectionReader(f, 0, info.Size()), Format: ff, Context: ctx}, f, nil
+			return &archives.ArchiveFS{Stream: io.NewSectionReader(f, 0, info.Size()), Format: ff, Context: ctx}, nil
 		case archives.Compression:
-			return archiverext.FileFS{File: f, Compression: ff}, f, nil
+			return archiverext.FileFS{File: f, Compression: ff}, nil
 		}
 	}
-	_ = f.Close()
-	return nil, nil, archives.NoMatch
+	return nil, archives.NoMatch
+}
+
+// archiverFileSystem opens the archive at p and returns a view of it. The returned closer
+// must be closed once the view is no longer used.
+func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, io.Closer, error) {
+	f, err := fs.unixFS.Open(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	fsys, err := archiveFS(ctx, f, p)
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	return fsys, f, nil
 }
 
 // SpaceAvailableForDecompression looks through a given archive and determines
@@ -108,15 +110,27 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 	if fs.MaxDisk() <= 0 {
 		return nil
 	}
+	f, err := fs.unixFS.Open(filepath.Join(dir, file))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return fs.spaceForArchive(ctx, f, file)
+}
 
-	fsys, archive, err := fs.archiverFileSystem(ctx, filepath.Join(dir, file))
+// spaceForArchive determines whether extracting the archive read from f would put the server over
+// its disk limit. Users go through this with a descriptor that has been checked against the rules.
+func (fs *Filesystem) spaceForArchive(ctx context.Context, f ufs.File, name string) error {
+	if fs.MaxDisk() <= 0 {
+		return nil
+	}
+	fsys, err := archiveFS(ctx, f, name)
 	if err != nil {
 		if errors.Is(err, archives.NoMatch) {
 			return newFilesystemError(ErrCodeUnknownArchive, err)
 		}
 		return err
 	}
-	defer archive.Close()
 
 	var size atomic.Int64
 	return iofs.WalkDir(fsys, ".", func(path string, d iofs.DirEntry, err error) error {
@@ -205,6 +219,11 @@ type extractStreamOptions struct {
 	Format archives.Format
 	// Reader for the archive.
 	Reader io.Reader
+	// Restricted extracts for a user. Entries that would be written to a hidden or protected
+	// location, or over a hard linked file, are skipped, and every write is made through a
+	// descriptor that is checked against the rules. Internal extraction, such as a transfer,
+	// writes every entry.
+	Restricted bool
 }
 
 func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptions) error {
@@ -221,16 +240,15 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		// Strip the compression suffix
 		p := filepath.Join(opts.Directory, strings.TrimSuffix(opts.FileName, opts.Format.Extension()))
 
-		// Make sure it's not ignored
-		if err := fs.IsIgnored(p); err != nil {
-			return nil
-		}
-
 		reader, err := de.OpenReader(opts.Reader)
 		if err != nil {
 			return err
 		}
 		defer reader.Close()
+
+		if opts.Restricted {
+			return fs.writeEntry(p, reader, -1, 0o644, time.Time{}, true)
+		}
 
 		// Open the file for creation/writing
 		f, err := fs.unixFS.OpenFile(p, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
@@ -275,11 +293,11 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 	// Decompress and extract archive
 	return ex.Extract(ctx, opts.Reader, func(ctx context.Context, f archives.FileInfo) error {
-		p := filepath.Join(opts.Directory, f.NameInArchive)
-		// If it is ignored, just don't do anything with the entry and skip over it.
-		if err := fs.IsIgnored(p); err != nil {
-			return nil
+		if opts.Restricted {
+			return fs.extractRestrictedEntry(opts, f)
 		}
+
+		p := filepath.Join(opts.Directory, f.NameInArchive)
 		// Create directories explicitly; an empty one has no file to create it
 		// implicitly and would otherwise be dropped during extraction.
 		if f.IsDir() {
@@ -302,4 +320,19 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		}
 		return nil
 	})
+}
+
+// extractRestrictedEntry writes one entry of an archive extracted for a user. The name is
+// cleaned as if it were rooted, so an entry cannot climb out of the directory it is extracted to.
+func (fs *Filesystem) extractRestrictedEntry(opts extractStreamOptions, f archives.FileInfo) error {
+	p := path.Join(opts.Directory, path.Clean("/"+f.NameInArchive))
+	if f.IsDir() {
+		return wrapError(fs.ensureDirectory(p, true), opts.FileName)
+	}
+	r, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return wrapError(fs.writeEntry(p, r, f.Size(), f.Mode(), f.ModTime(), true), opts.FileName)
 }

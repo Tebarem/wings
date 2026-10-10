@@ -41,7 +41,7 @@ func NewFs() (*Filesystem, *rootFs) {
 		return nil, nil
 	}
 
-	fs, _ := New(p, 0, []string{})
+	fs, _ := New(p, 0, nil, nil)
 	fs.isTest = true
 	if err := fs.TruncateRootDirectory(); err != nil {
 		panic(err)

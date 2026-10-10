@@ -232,7 +232,7 @@ func (dl *Download) Execute() error {
 	// Write the file while tracking the progress, Write will check that the
 	// size of the file won't exceed the disk limit.
 	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
-	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
+	if err := dl.server.Filesystem().Restricted().Write(p, r, res.ContentLength, 0o644); err != nil {
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
 	return nil

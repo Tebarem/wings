@@ -151,9 +151,18 @@ func (c DockerConfiguration) RegistryCredentialsForImage(img string) (string, *R
 	var matchedCredentials RegistryConfiguration
 	matchedScore := -1
 
-	for registry, cfg := range c.Registries {
-		domain, path, ok := parseDockerRegistryReference(registry)
-		if !ok || domain != imageDomain || !registryPathMatchesImage(path, imagePath) {
+	// Walk the entries in sorted order so that when two entries score the same the
+	// lexicographically smallest registry key always wins, regardless of map order.
+	registries := make([]string, 0, len(c.Registries))
+	for registry := range c.Registries {
+		registries = append(registries, registry)
+	}
+	sort.Strings(registries)
+
+	for _, registry := range registries {
+		cfg := c.Registries[registry]
+		domain, path, hubNS, ok := parseDockerRegistryReference(registry)
+		if !ok || domain != imageDomain || !registryPathMatchesImage(path, imagePath, hubNS) {
 			continue
 		}
 
@@ -172,10 +181,31 @@ func (c DockerConfiguration) RegistryCredentialsForImage(img string) (string, *R
 	return matchedRegistry, &matchedCredentials
 }
 
-func parseDockerRegistryReference(registry string) (string, string, bool) {
+// CredentialsForImage returns the registry credentials to use when pulling img.
+// Node-level registries from the configuration file always take precedence. The
+// extra credentials (supplied per server by the Panel) are only considered when
+// no node-level entry matches the image, and they are matched with exactly the
+// same rules as the node-level registries.
+func CredentialsForImage(img string, extra map[string]RegistryConfiguration) (string, *RegistryConfiguration) {
+	if registry, creds := Get().Docker.RegistryCredentialsForImage(img); creds != nil {
+		return registry, creds
+	}
+
+	if len(extra) == 0 {
+		return "", nil
+	}
+
+	return DockerConfiguration{Registries: extra}.RegistryCredentialsForImage(img)
+}
+
+// parseDockerRegistryReference splits a configured registry entry into its domain
+// and path. hubNS is true when the entry names a Docker Hub namespace without the
+// implicit "library/" prefix (for example "docker.io/myorg"), which the reference
+// package would otherwise normalize to "library/myorg".
+func parseDockerRegistryReference(registry string) (domain string, path string, hubNS bool, ok bool) {
 	registry = strings.TrimSpace(registry)
 	if registry == "" {
-		return "", "", false
+		return "", "", false, false
 	}
 
 	if u, err := url.Parse(registry); err == nil && u.Host != "" {
@@ -189,7 +219,7 @@ func parseDockerRegistryReference(registry string) (string, string, bool) {
 
 	registry = strings.Trim(registry, "/")
 	if registry == "" {
-		return "", "", false
+		return "", "", false, false
 	}
 
 	hasPath := strings.Contains(registry, "/")
@@ -200,27 +230,46 @@ func parseDockerRegistryReference(registry string) (string, string, bool) {
 
 	named, err := reference.ParseNormalizedNamed(ref)
 	if err != nil {
-		return "", "", false
+		return "", "", false, false
 	}
 
-	path := ""
+	path = ""
 	if hasPath {
 		path = reference.Path(named)
 	}
-	domain := strings.ToLower(reference.Domain(named))
+	domain = strings.ToLower(reference.Domain(named))
 	if domain == "docker.io" && (path == "v1" || path == "v2") {
 		path = ""
 	}
 
-	return domain, path, true
+	// Docker Hub normalizes a single segment namespace such as "myorg" to
+	// "library/myorg". Operators write Hub namespaces without that implicit prefix,
+	// so strip it and remember the entry is a Hub namespace. An operator who wrote
+	// "library" explicitly keeps the literal path.
+	if domain == "docker.io" && hasPath && strings.HasPrefix(path, "library/") && !strings.Contains(strings.TrimPrefix(path, "library/"), "/") {
+		_, rawPath, _ := strings.Cut(registry, "/")
+		if !strings.HasPrefix(rawPath, "library/") && rawPath != "library" {
+			path = strings.TrimPrefix(path, "library/")
+			hubNS = true
+		}
+	}
+
+	return domain, path, hubNS, true
 }
 
-func registryPathMatchesImage(registryPath string, imagePath string) bool {
+// registryPathMatchesImage reports whether imagePath is covered by registryPath.
+// For a Docker Hub namespace (hubNS) the official "library/" form of the image path
+// also matches, so "docker.io/nginx" still matches "nginx:latest".
+func registryPathMatchesImage(registryPath string, imagePath string, hubNS bool) bool {
 	if registryPath == "" {
 		return true
 	}
 
-	return imagePath == registryPath || strings.HasPrefix(imagePath, registryPath+"/")
+	if imagePath == registryPath || strings.HasPrefix(imagePath, registryPath+"/") {
+		return true
+	}
+
+	return hubNS && imagePath == "library/"+registryPath
 }
 
 // RegistryConfiguration defines the authentication credentials for a given
@@ -228,6 +277,20 @@ func registryPathMatchesImage(registryPath string, imagePath string) bool {
 type RegistryConfiguration struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+// String redacts the credentials when formatted with %v, %+v or %s. fmt only calls
+// it for this value and for exported fields or elements it reaches; it cannot call
+// it through unexported fields. Never log these structs, or any struct containing
+// them, directly.
+func (c RegistryConfiguration) String() string {
+	return "{Username:[REDACTED] Password:[REDACTED]}"
+}
+
+// GoString redacts the credentials when formatted with %#v. The same limits as
+// String apply, so never log these structs directly.
+func (c RegistryConfiguration) GoString() string {
+	return "config.RegistryConfiguration{Username:\"[REDACTED]\", Password:\"[REDACTED]\"}"
 }
 
 // Base64 returns the authentication for a given registry as a base64 encoded

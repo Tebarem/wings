@@ -76,7 +76,7 @@ func testBackupGenerateRequiresUuidIdentifier(t *testing.T, createBackup func(st
 	if err := os.WriteFile(filepath.Join(serverDir, "file.txt"), []byte("server data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fsys, err := filesystem.New(serverDir, 0, nil)
+	fsys, err := filesystem.New(serverDir, 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

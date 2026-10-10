@@ -13,13 +13,16 @@ import (
 type ErrorCode string
 
 const (
-	ErrCodeIsDirectory    ErrorCode = "E_ISDIR"
-	ErrCodeDiskSpace      ErrorCode = "E_NODISK"
-	ErrCodeUnknownArchive ErrorCode = "E_UNKNFMT"
-	ErrCodePathResolution ErrorCode = "E_BADPATH"
-	ErrCodeDenylistFile   ErrorCode = "E_DENYLIST"
-	ErrCodeUnknownError   ErrorCode = "E_UNKNOWN"
-	ErrNotExist           ErrorCode = "E_NOTEXIST"
+	ErrCodeIsDirectory        ErrorCode = "E_ISDIR"
+	ErrCodeDiskSpace          ErrorCode = "E_NODISK"
+	ErrCodeUnknownArchive     ErrorCode = "E_UNKNFMT"
+	ErrCodePathResolution     ErrorCode = "E_BADPATH"
+	ErrCodeDenylistFile       ErrorCode = "E_DENYLIST"
+	ErrCodeHardlink           ErrorCode = "E_HARDLINK"
+	ErrCodeRestrictedContents ErrorCode = "E_RESTRICTEDCONTENTS"
+	ErrCodeNotRegular         ErrorCode = "E_NOTREGULAR"
+	ErrCodeUnknownError       ErrorCode = "E_UNKNOWN"
+	ErrNotExist               ErrorCode = "E_NOTEXIST"
 )
 
 type Error struct {
@@ -64,6 +67,12 @@ func (e *Error) Error() string {
 			r = "<empty>"
 		}
 		return fmt.Sprintf("filesystem: file access prohibited: [%s] is on the denylist", r)
+	case ErrCodeHardlink:
+		return "filesystem: hard linked file cannot be accessed while rules are configured"
+	case ErrCodeNotRegular:
+		return "filesystem: not a regular file"
+	case ErrCodeRestrictedContents:
+		return "filesystem: directory contains files that cannot be modified"
 	case ErrCodePathResolution:
 		r := e.resolved
 		if r == "" {

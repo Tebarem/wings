@@ -72,6 +72,7 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
+		Restricted: true,
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")
