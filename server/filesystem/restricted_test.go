@@ -472,6 +472,24 @@ func TestRestricted_Archives(t *testing.T) {
 			g.Assert(contains(entries, "hiddendir/file.txt")).IsFalse()
 		})
 
+		g.It("applies the ignore list to a restricted archive", func() {
+			fs, rfs := restrictedFixture(t)
+			mustWriteFile(t, rfs, "logs/latest.log", "log")
+			mustWriteFile(t, rfs, "world (copy)/level.dat", "level")
+
+			dst := filepath.Join(t.TempDir(), "backup.tar.gz")
+			a := &Archive{Filesystem: fs, Restricted: true, Ignore: "*.log\nworld (copy)/\n"}
+			g.Assert(a.Create(context.Background(), dst)).IsNil()
+
+			entries := archiveEntries(t, dst)
+			g.Assert(contains(entries, "visible.txt")).IsTrue()
+			g.Assert(contains(entries, "plugins/plain.txt")).IsTrue()
+			g.Assert(contains(entries, "logs/latest.log")).IsFalse()
+			g.Assert(contains(entries, "world (copy)/level.dat")).IsFalse()
+			g.Assert(contains(entries, "Licensed.jar")).IsFalse()
+			g.Assert(contains(entries, "hidden.txt")).IsFalse()
+		})
+
 		g.It("includes everything when the archive is not restricted", func() {
 			fs, _ := restrictedFixture(t)
 			dst := filepath.Join(t.TempDir(), "transfer.tar.gz")
