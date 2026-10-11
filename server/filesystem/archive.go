@@ -250,27 +250,18 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 // Callback function used to determine if a given file should be included in the archive
 // being generated.
 func (a *Archive) callback(opts ...walkFunc) walkFunc {
-	// Get the base directory we need to strip when walking.
-	//
-	// This is important as when we are walking, the last part of the base directory
-	// is present on all the paths we walk.
-	var base string
-	if a.BaseDirectory != "" {
-		base = filepath.Base(a.BaseDirectory) + "/"
-	}
 	return func(dirfd int, name, relative string, d ufs.DirEntry) error {
 		// Skip directories because we are walking them recursively.
 		if d.IsDir() {
 			return nil
 		}
 
-		// If base isn't empty, strip it from the relative path. This fixes an
-		// issue when creating an archive starting from a nested directory.
+		// The walk starts at the base directory, so relative is already relative to it. It must
+		// not be trimmed of the base directory's name: a directory beneath the base that has the
+		// same name would lose its own name, and its files would be archived under the wrong path
+		// or not at all.
 		//
-		// See https://github.com/pterodactyl/panel/issues/5030 for more details.
-		if base != "" {
-			relative = strings.TrimPrefix(relative, base)
-		}
+		// See https://github.com/pterodactyl/panel/issues/5030 for the original nested directory case.
 
 		// Call the additional options passed to this callback function. If any of them return
 		// a non-nil error we will exit immediately.
