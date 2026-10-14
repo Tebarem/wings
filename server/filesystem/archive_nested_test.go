@@ -21,7 +21,7 @@ func TestArchive_NestedDirectoryWithBaseName(t *testing.T) {
 			info, err := fs.Restricted().CompressFiles("/plugins", []string{"plugins", "plain.txt"})
 			g.Assert(err).IsNil()
 
-			entries := archiveEntries(t, serverFile(rfs, "plugins/"+info.Name()))
+			entries := archiveNamesOf(t, serverFile(rfs, "plugins/"+info.Name()))
 			g.Assert(contains(entries, "plugins/inner.txt")).IsTrue()
 			g.Assert(contains(entries, "plain.txt")).IsTrue()
 			g.Assert(contains(entries, "inner.txt")).IsFalse()
@@ -35,7 +35,7 @@ func TestArchive_NestedDirectoryWithBaseName(t *testing.T) {
 			a := &Archive{Filesystem: fs, BaseDirectory: "plugins", Restricted: true}
 			g.Assert(a.Create(context.Background(), dst)).IsNil()
 
-			entries := archiveEntries(t, dst)
+			entries := archiveNamesOf(t, dst)
 			g.Assert(contains(entries, "plugins/inner.txt")).IsTrue()
 			g.Assert(contains(entries, "plain.txt")).IsTrue()
 			g.Assert(contains(entries, "token.key")).IsFalse()
@@ -49,7 +49,7 @@ func TestArchive_NestedDirectoryWithBaseName(t *testing.T) {
 			a := &Archive{Filesystem: fs, BaseDirectory: "plugins"}
 			g.Assert(a.Create(context.Background(), dst)).IsNil()
 
-			entries := archiveEntries(t, dst)
+			entries := archiveNamesOf(t, dst)
 			g.Assert(contains(entries, "plugins/inner.txt")).IsTrue()
 			g.Assert(contains(entries, "plain.txt")).IsTrue()
 			g.Assert(contains(entries, "inner.txt")).IsFalse()

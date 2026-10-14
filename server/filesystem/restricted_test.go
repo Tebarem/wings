@@ -66,7 +66,7 @@ func isHardlink(err error) bool {
 }
 
 // archiveEntries returns the names of the files in a gzipped tar archive.
-func archiveEntries(t *testing.T, p string) []string {
+func archiveNamesOf(t *testing.T, p string) []string {
 	t.Helper()
 	f, err := os.Open(p)
 	if err != nil {
@@ -426,7 +426,7 @@ func TestRestricted_Archives(t *testing.T) {
 			info, err := fs.Restricted().CompressFiles("/", []string{"visible.txt", "Licensed.jar", "hidden.txt", "plugins", "hiddendir"})
 			g.Assert(err).IsNil()
 
-			entries := archiveEntries(t, serverFile(rfs, info.Name()))
+			entries := archiveNamesOf(t, serverFile(rfs, info.Name()))
 			g.Assert(contains(entries, "visible.txt")).IsTrue()
 			g.Assert(contains(entries, "plugins/plain.txt")).IsTrue()
 			g.Assert(contains(entries, "Licensed.jar")).IsFalse()
@@ -461,7 +461,7 @@ func TestRestricted_Archives(t *testing.T) {
 			a := &Archive{Filesystem: fs, Restricted: true}
 			g.Assert(a.Create(context.Background(), dst)).IsNil()
 
-			entries := archiveEntries(t, dst)
+			entries := archiveNamesOf(t, dst)
 			g.Assert(contains(entries, "visible.txt")).IsTrue()
 			g.Assert(contains(entries, "plugins/plain.txt")).IsTrue()
 			g.Assert(contains(entries, "Licensed.jar")).IsFalse()
@@ -481,7 +481,7 @@ func TestRestricted_Archives(t *testing.T) {
 			a := &Archive{Filesystem: fs, Restricted: true, Ignore: "*.log\nworld (copy)/\n"}
 			g.Assert(a.Create(context.Background(), dst)).IsNil()
 
-			entries := archiveEntries(t, dst)
+			entries := archiveNamesOf(t, dst)
 			g.Assert(contains(entries, "visible.txt")).IsTrue()
 			g.Assert(contains(entries, "plugins/plain.txt")).IsTrue()
 			g.Assert(contains(entries, "logs/latest.log")).IsFalse()
@@ -496,7 +496,7 @@ func TestRestricted_Archives(t *testing.T) {
 			a := &Archive{Filesystem: fs}
 			g.Assert(a.Create(context.Background(), dst)).IsNil()
 
-			entries := archiveEntries(t, dst)
+			entries := archiveNamesOf(t, dst)
 			g.Assert(contains(entries, "Licensed.jar")).IsTrue()
 			g.Assert(contains(entries, "hidden.txt")).IsTrue()
 		})

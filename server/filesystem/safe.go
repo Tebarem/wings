@@ -615,11 +615,17 @@ func (fs *Filesystem) writeEntry(p string, rd io.Reader, size int64, mode ufs.Fi
 	if t.exists() && t.st.Mode().IsRegular() {
 		currentSize = t.st.Size()
 	}
+	// Reserve the space for the write, so that writes happening at the same time cannot each use
+	// the space that is left. The reservation is released when the write finishes. A write of an
+	// unknown size reserves the space for each chunk as it is read instead.
+	var reserved, used int64
 	if size >= 0 {
-		if err := fs.HasSpaceFor(size - currentSize); err != nil {
+		if err := fs.reserveDisk(size - currentSize); err != nil {
 			return err
 		}
+		reserved = max(size-currentSize, 0)
 	}
+	defer func() { fs.releaseDisk(reserved, used) }()
 
 	if t.exists() && !t.st.Mode().IsRegular() {
 		if skipRestricted {
@@ -650,21 +656,23 @@ func (fs *Filesystem) writeEntry(p string, rd io.Reader, size int64, mode ufs.Fi
 		return err
 	}
 
+	// The old contents are gone once the file is truncated.
+	used = -currentSize
 	var n int64
 	switch {
 	case size == 0:
 	case size > 0:
 		n, err = io.Copy(f, io.LimitReader(rd, size))
-		fs.unixFS.Add(n - currentSize)
+		used = n - currentSize
 	default:
+		// Each chunk reserves its own space as it is written, so only the old contents are
+		// removed from the usage here.
 		n, err = copyWithQuota(fs, f, rd)
 		fs.unixFS.Add(-currentSize)
+		used = 0
 	}
 	if err != nil {
 		return err
-	}
-	if size == 0 {
-		fs.unixFS.Add(-currentSize)
 	}
 
 	if err := fs.chownFd(int(f.Fd())); err != nil {
@@ -683,11 +691,11 @@ func copyWithQuota(fs *Filesystem, dst io.Writer, rd io.Reader) (int64, error) {
 	for {
 		n, rerr := rd.Read(buf)
 		if n > 0 {
-			if err := fs.HasSpaceFor(int64(n)); err != nil {
+			if err := fs.reserveDisk(int64(n)); err != nil {
 				return total, err
 			}
 			w, err := dst.Write(buf[:n])
-			fs.unixFS.Add(int64(w))
+			fs.releaseDisk(int64(n), int64(w))
 			total += int64(w)
 			if err != nil {
 				return total, err

@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
@@ -17,7 +17,6 @@ import (
 	"github.com/mholt/archives"
 
 	"github.com/pterodactyl/wings/internal/ufs"
-	"github.com/pterodactyl/wings/server/filesystem/archiverext"
 )
 
 // CompressFiles compresses all the files matching the given paths in the
@@ -31,85 +30,65 @@ import (
 // `archive-{date}.tar.gz`.
 func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, error) {
 	a := &Archive{Filesystem: fs, BaseDirectory: dir, Files: paths}
-	d := path.Join(
-		dir,
-		fmt.Sprintf("archive-%s.tar.gz", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "")),
+	name := fmt.Sprintf("archive-%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""))
+
+	// Never write into an existing file, such as an archive created by another
+	// request within the same second.
+	var (
+		d   string
+		f   ufs.File
+		err error
 	)
-	f, err := fs.unixFS.OpenFile(d, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	cw := ufs.NewCountedWriter(f)
-	if err := a.Stream(context.Background(), cw); err != nil {
-		return nil, err
-	}
-	if cw.BytesWritten() < 0 || !fs.unixFS.CanFit(cw.BytesWritten()) {
-		_ = fs.unixFS.Remove(d)
-		return nil, newFilesystemError(ErrCodeDiskSpace, nil)
-	}
-	fs.unixFS.Add(cw.BytesWritten())
-	return f.Stat()
-}
-
-// archiveFS returns a read-only view of the archive read from f. The file is rewound first,
-// and it is not closed, so the caller keeps ownership of it.
-func archiveFS(ctx context.Context, f ufs.File, name string) (iofs.FS, error) {
-	format, _, err := archives.Identify(ctx, filepath.Base(name), f)
-	if err != nil && !errors.Is(err, archives.NoMatch) {
-		return nil, err
-	}
-
-	// Reset the file reader.
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-
-	if format != nil {
-		switch ff := format.(type) {
-		case archives.Zip:
-			// zip.Reader is more performant than ArchiveFS, because zip.Reader caches content information
-			// and zip.Reader can open several content files concurrently because of io.ReaderAt requirement
-			// while ArchiveFS can't.
-			// zip.Reader doesn't suffer from issue #330 and #310 according to local test (but they should be fixed anyway)
-			return zip.NewReader(f, info.Size())
-		case archives.Extraction:
-			return &archives.ArchiveFS{Stream: io.NewSectionReader(f, 0, info.Size()), Format: ff, Context: ctx}, nil
-		case archives.Compression:
-			return archiverext.FileFS{File: f, Compression: ff}, nil
+	for i := 0; ; i++ {
+		d = path.Join(dir, name+".tar.gz")
+		if i > 0 {
+			d = path.Join(dir, fmt.Sprintf("%s-%d.tar.gz", name, i))
+		}
+		f, err = fs.unixFS.OpenFile(d, ufs.O_WRONLY|ufs.O_CREATE|ufs.O_EXCL, 0o644)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ufs.ErrExist) || i >= 100 {
+			return nil, err
 		}
 	}
-	return nil, archives.NoMatch
+
+	// Count every write to the archive against the disk limit as it happens, so
+	// that archives being created at the same time cannot each use all the space
+	// that is left.
+	qf := newQuotaFile(fs, f, 0)
+	if err := a.Stream(context.Background(), qf); err != nil {
+		_ = qf.Close()
+		_ = fs.unixFS.Remove(d)
+		return nil, err
+	}
+	st, err := qf.Stat()
+	if err != nil {
+		_ = qf.Close()
+		return nil, err
+	}
+	if err := qf.Close(); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
-// archiverFileSystem opens the archive at p and returns a view of it. The returned closer
-// must be closed once the view is no longer used.
-func (fs *Filesystem) archiverFileSystem(ctx context.Context, p string) (iofs.FS, io.Closer, error) {
-	f, err := fs.unixFS.Open(p)
-	if err != nil {
-		return nil, nil, err
-	}
-	fsys, err := archiveFS(ctx, f, p)
-	if err != nil {
-		_ = f.Close()
-		return nil, nil, err
-	}
-	return fsys, f, nil
-}
+// maxArchiveEntryNameLength is the longest name an entry in an archive can have,
+// which matches the longest path that can be created on Linux.
+const maxArchiveEntryNameLength = 4096
 
 // SpaceAvailableForDecompression looks through a given archive and determines
 // if decompressing it would put the server over its allocated disk space limit.
+//
+// The entries are read one at a time rather than opening the archive as a file
+// system, which is much faster for large archives.
 func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir string, file string) error {
 	// Don't waste time trying to determine this if we know the server will have the space for
 	// it since there is no limit.
 	if fs.MaxDisk() <= 0 {
 		return nil
 	}
+
 	f, err := fs.unixFS.Open(filepath.Join(dir, file))
 	if err != nil {
 		return err
@@ -120,49 +99,73 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 
 // spaceForArchive determines whether extracting the archive read from f would put the server over
 // its disk limit. Users go through this with a descriptor that has been checked against the rules.
-func (fs *Filesystem) spaceForArchive(ctx context.Context, f ufs.File, name string) error {
+func (fs *Filesystem) spaceForArchive(ctx context.Context, f ufs.File, file string) error {
 	if fs.MaxDisk() <= 0 {
 		return nil
 	}
-	fsys, err := archiveFS(ctx, f, name)
+
+	format, _, err := archives.Identify(ctx, filepath.Base(file), f)
+	if err != nil && !errors.Is(err, archives.NoMatch) {
+		return err
+	}
+	// Reset the file reader.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	info, err := f.Stat()
 	if err != nil {
-		if errors.Is(err, archives.NoMatch) {
-			return newFilesystemError(ErrCodeUnknownArchive, err)
-		}
 		return err
 	}
 
-	var size atomic.Int64
-	return iofs.WalkDir(fsys, ".", func(path string, d iofs.DirEntry, err error) error {
+	var size int64
+	add := func(name string, n int64) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if len(name) > maxArchiveEntryNameLength {
+			return errors.New("filesystem: archive contains an entry with a name that is too long")
+		}
+		if n <= 0 {
+			return nil
+		}
+		if n > math.MaxInt64-size {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		size += n
+		if !fs.unixFS.CanFit(size) {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		return nil
+	}
+
+	switch ff := format.(type) {
+	case archives.Zip:
+		// The sizes can be read straight from the central directory of a zip.
+		reader, err := zip.NewReader(f, info.Size())
 		if err != nil {
 			return err
 		}
-
-		select {
-		case <-ctx.Done():
-			// Stop walking if the context is canceled.
-			return ctx.Err()
-		default:
-			info, err := d.Info()
-			if err != nil {
+		for _, e := range reader.File {
+			if e.UncompressedSize64 > math.MaxInt64 {
+				return newFilesystemError(ErrCodeDiskSpace, nil)
+			}
+			if err := add(e.Name, int64(e.UncompressedSize64)); err != nil {
 				return err
 			}
-			fileSize := info.Size()
-			if fileSize <= 0 {
-				return nil
-			}
-			current := size.Load()
-			if fileSize > math.MaxInt64-current {
-				return newFilesystemError(ErrCodeDiskSpace, nil)
-			}
-			next := current + fileSize
-			if !fs.unixFS.CanFit(next) {
-				return newFilesystemError(ErrCodeDiskSpace, nil)
-			}
-			size.Store(next)
-			return nil
 		}
-	})
+		return nil
+	case archives.Extraction:
+		return ff.Extract(ctx, io.NewSectionReader(f, 0, info.Size()), func(ctx context.Context, e archives.FileInfo) error {
+			return add(e.NameInArchive, e.Size())
+		})
+	case archives.Compression:
+		// A single compressed file is checked against the disk limit as it is
+		// decompressed, since its size is not known until then.
+		return add(file, info.Size())
+	}
+	return newFilesystemError(ErrCodeUnknownArchive, archives.NoMatch)
 }
 
 // DecompressFile will decompress a file in a given directory by using the
@@ -194,7 +197,15 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 	})
 }
 
-// ExtractStreamUnsafe .
+// ExtractTransfer extracts the archive of a server that is being transferred to
+// this node into the server's directory. Every file is kept, since they are the
+// server's own files.
+func (fs *Filesystem) ExtractTransfer(ctx context.Context, r io.Reader) error {
+	return fs.ExtractStreamUnsafe(ctx, "/", r)
+}
+
+// ExtractStreamUnsafe extracts the archive read from r into dir. Every entry is
+// written, the rules do not apply, so it must only be used internally.
 func (fs *Filesystem) ExtractStreamUnsafe(ctx context.Context, dir string, r io.Reader) error {
 	format, input, err := archives.Identify(ctx, "archive.tar.gz", r)
 	if err != nil {
@@ -247,47 +258,15 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		defer reader.Close()
 
 		if opts.Restricted {
-			return fs.writeEntry(p, reader, -1, 0o644, time.Time{}, true)
+			// The size is not known ahead of time, so each write is counted against the disk limit.
+			return wrapError(fs.writeEntry(p, reader, -1, 0o644, time.Time{}, true), opts.FileName)
 		}
 
-		// Open the file for creation/writing
-		f, err := fs.unixFS.OpenFile(p, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
-		if err != nil {
-			return err
+		// Write the file, counting each write against the disk limit. The file is
+		// removed if it does not fit.
+		if _, err := fs.WriteFrom(p, reader); err != nil {
+			return wrapError(err, opts.FileName)
 		}
-		defer f.Close()
-
-		// Read in 4 KB chunks
-		buf := make([]byte, 4096)
-		for {
-			n, err := reader.Read(buf)
-			if n > 0 {
-
-				// Check quota before writing the chunk
-				if quotaErr := fs.HasSpaceFor(int64(n)); quotaErr != nil {
-					return quotaErr
-				}
-
-				// Write the chunk
-				if _, writeErr := f.Write(buf[:n]); writeErr != nil {
-					return writeErr
-				}
-
-				// Add to quota
-				fs.addDisk(int64(n))
-			}
-
-			if err != nil {
-				// EOF are expected
-				if err == io.EOF {
-					break
-				}
-
-				// Return any other
-				return err
-			}
-		}
-
 		return nil
 	}
 
@@ -304,6 +283,25 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			if err := fs.mkdirAll(p, 0o755); err != nil {
 				return wrapError(err, opts.FileName)
 			}
+			return nil
+		}
+		if f.Mode()&iofs.ModeSymlink != 0 {
+			if f.LinkTarget == "" {
+				return nil
+			}
+			if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+				return wrapError(err, opts.FileName)
+			}
+			if err := fs.Symlink(f.LinkTarget, p); err != nil && !errors.Is(err, ufs.ErrExist) {
+				return wrapError(err, opts.FileName)
+			}
+			return nil
+		}
+		// Hard links, devices and other special files are not extracted.
+		if !f.Mode().IsRegular() {
+			return nil
+		}
+		if h, ok := f.Header.(*tar.Header); ok && h.Typeflag == tar.TypeLink {
 			return nil
 		}
 		r, err := f.Open()
@@ -324,10 +322,24 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 // extractRestrictedEntry writes one entry of an archive extracted for a user. The name is
 // cleaned as if it were rooted, so an entry cannot climb out of the directory it is extracted to.
+// Hidden and protected entries are skipped, the same as a restore, and so are hard links.
 func (fs *Filesystem) extractRestrictedEntry(opts extractStreamOptions, f archives.FileInfo) error {
 	p := path.Join(opts.Directory, path.Clean("/"+f.NameInArchive))
 	if f.IsDir() {
 		return wrapError(fs.ensureDirectory(p, true), opts.FileName)
+	}
+	if f.Mode()&iofs.ModeSymlink != 0 {
+		if f.LinkTarget == "" {
+			return nil
+		}
+		return wrapError(fs.restoreSymlink(p, f.LinkTarget), opts.FileName)
+	}
+	// Hard links, devices and other special files are not extracted.
+	if !f.Mode().IsRegular() {
+		return nil
+	}
+	if h, ok := f.Header.(*tar.Header); ok && h.Typeflag == tar.TypeLink {
+		return nil
 	}
 	r, err := f.Open()
 	if err != nil {

@@ -273,6 +273,49 @@ func (r *Restricted) Restore(p string, reader io.Reader, info ufs.FileInfo) erro
 	return r.fs.writeEntry(p, reader, info.Size(), info.Mode(), info.ModTime(), true)
 }
 
+// RestoreSymlink creates a symbolic link at p pointing at target as part of a restore, with the
+// same rules as Restore: missing parent directories are made, a hidden or protected entry is
+// skipped, and so is an entry that already exists. The target is not checked, the same as Symlink.
+func (r *Restricted) RestoreSymlink(p, target string) error {
+	return r.fs.restoreSymlink(p, target)
+}
+
+// restoreSymlink creates the symbolic link p pointing at target, skipping it when p is restricted
+// or already exists. See Restricted.RestoreSymlink.
+func (fs *Filesystem) restoreSymlink(p, target string) error {
+	t, err := fs.locate(p, true, false)
+	if err != nil {
+		return err
+	}
+	defer t.close()
+	if t.level != LevelNone || t.exists() || t.dirfd < 0 || t.name == "." {
+		return nil
+	}
+	return unix.Symlinkat(target, t.dirfd, t.name)
+}
+
+// WriteFrom writes the contents of r to p, creating the file or truncating it if it exists, and
+// returns the number of bytes written. Each write is counted against the disk limit as it happens,
+// so the size does not need to be known ahead of time. If writing fails the file is removed.
+func (r *Restricted) WriteFrom(p string, reader io.Reader) (int64, error) {
+	f, err := r.Touch(p, ufs.O_RDWR|ufs.O_TRUNC)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(f, reader)
+	if err == nil {
+		err = r.fs.chownFd(int(f.Fd()))
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = r.Delete(p)
+		return n, err
+	}
+	return n, nil
+}
+
 // Touch opens the file at p, creating it if needed, the same as Filesystem.Touch.
 func (r *Restricted) Touch(p string, flag int) (ufs.File, error) {
 	t, err := r.fs.locate(p, true, true)
@@ -550,9 +593,13 @@ func (r *Restricted) Copy(p string) error {
 		return hardlinkError(p)
 	}
 	size := info.Size()
-	if err := r.fs.HasSpaceFor(size); err != nil {
+	// Reserve the space so that copies happening at the same time cannot each use it.
+	if err := r.fs.reserveDisk(size); err != nil {
 		return err
 	}
+	// Release the reservation even if the copy panics, see Filesystem.Write.
+	var used int64
+	defer func() { r.fs.releaseDisk(size, used) }()
 
 	base := t.name
 	extension := filepath.Ext(base)
@@ -583,7 +630,7 @@ func (r *Restricted) Copy(p string) error {
 	defer dst.Close()
 
 	n, err := io.Copy(dst, io.LimitReader(src, size))
-	r.fs.unixFS.Add(n)
+	used = n
 	if err != nil {
 		return err
 	}
@@ -600,29 +647,52 @@ func (r *Restricted) CompressFiles(dir string, paths []string) (ufs.FileInfo, er
 	defer d.Close()
 	dirfd := int(d.Fd())
 
-	name := fmt.Sprintf("archive-%s.tar.gz", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""))
-	if lvl := r.fs.rules.levelAt(path.Join(dirCanonical, name), kindFile); lvl != LevelNone {
-		return nil, refusal(path.Join(dirCanonical, name), lvl)
+	// Never write into an existing file, such as an archive created by another request within
+	// the same second.
+	stamp := fmt.Sprintf("archive-%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""))
+	var (
+		name string
+		af   ufs.File
+	)
+	for i := 0; ; i++ {
+		name = stamp + ".tar.gz"
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d.tar.gz", stamp, i)
+		}
+		if lvl := r.fs.rules.levelAt(path.Join(dirCanonical, name), kindFile); lvl != LevelNone {
+			return nil, refusal(path.Join(dirCanonical, name), lvl)
+		}
+		af, err = r.fs.unixFS.OpenFileat(dirfd, name, ufs.O_WRONLY|ufs.O_CREATE|ufs.O_EXCL, 0o644)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ufs.ErrExist) || i >= 100 {
+			return nil, err
+		}
 	}
-	afd, err := unix.Openat(dirfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	af := os.NewFile(uintptr(afd), path.Join(dirCanonical, name))
-	defer af.Close()
 
+	// Count every write to the archive against the disk limit as it happens, so that archives
+	// being created at the same time cannot each use all the space that is left.
+	qf := newQuotaFile(r.fs, af, 0)
 	a := &Archive{Filesystem: r.fs, BaseDirectory: dirCanonical, Files: paths, Restricted: true}
-	cw := ufs.NewCountedWriter(af)
-	if err := a.Stream(context.Background(), cw); err != nil {
+	if err := a.Stream(context.Background(), qf); err != nil {
+		// Give back the space the partial archive used before removing it.
+		if st, serr := qf.Stat(); serr == nil {
+			r.fs.unixFS.Add(-st.Size())
+		}
+		_ = qf.Close()
 		_ = unix.Unlinkat(dirfd, name, 0)
 		return nil, err
 	}
-	if cw.BytesWritten() < 0 || !r.fs.unixFS.CanFit(cw.BytesWritten()) {
-		_ = unix.Unlinkat(dirfd, name, 0)
-		return nil, newFilesystemError(ErrCodeDiskSpace, nil)
+	st, err := qf.Stat()
+	if err != nil {
+		_ = qf.Close()
+		return nil, err
 	}
-	r.fs.unixFS.Add(cw.BytesWritten())
-	return af.Stat()
+	if err := qf.Close(); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // DecompressFile extracts an archive in dir. Entries that would be written to a restricted

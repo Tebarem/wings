@@ -165,13 +165,13 @@ func TestRestricted_Hardlinks(t *testing.T) {
 			hardlinked(t, rfs)
 			info, err := fs.Restricted().CompressFiles("/", []string{"copy.txt", "visible.txt"})
 			g.Assert(err).IsNil()
-			entries := archiveEntries(t, serverFile(rfs, info.Name()))
+			entries := archiveNamesOf(t, serverFile(rfs, info.Name()))
 			g.Assert(contains(entries, "copy.txt")).IsFalse()
 			g.Assert(contains(entries, "visible.txt")).IsTrue()
 
 			dst := filepath.Join(t.TempDir(), "backup.tar.gz")
 			g.Assert((&Archive{Filesystem: fs, Restricted: true}).Create(context.Background(), dst)).IsNil()
-			g.Assert(contains(archiveEntries(t, dst), "copy.txt")).IsFalse()
+			g.Assert(contains(archiveNamesOf(t, dst), "copy.txt")).IsFalse()
 		})
 
 		g.It("allows hard links when no rules are configured", func() {
