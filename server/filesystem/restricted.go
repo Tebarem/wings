@@ -246,8 +246,11 @@ func (r *Restricted) listDirectory(p string, withMime bool) ([]Stat, error) {
 		case withMime && info.Mode().IsRegular() && lvl != LevelProtected && !r.fs.hardlinked(info):
 			if cf, err := unix.Openat(fd, n, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); err == nil {
 				f := os.NewFile(uintptr(cf), n)
-				if m, err := mimetype.DetectReader(f); err == nil {
-					st.Mimetype = m.String()
+				// Only a regular file is read, a FIFO swapped in for the entry would block the sniff.
+				if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+					if m, err := mimetype.DetectReader(f); err == nil {
+						st.Mimetype = m.String()
+					}
 				}
 				_ = f.Close()
 			}
@@ -330,10 +333,6 @@ func (r *Restricted) Touch(p string, flag int) (ufs.File, error) {
 		return nil, &Error{code: ErrCodeIsDirectory, resolved: p}
 	}
 
-	var currentSize int64
-	if t.exists() {
-		currentSize = t.st.Size()
-	}
 	if t.exists() && !t.st.Mode().IsRegular() {
 		return nil, notRegularError(p)
 	}
@@ -354,6 +353,8 @@ func (r *Restricted) Touch(p string, flag int) (ufs.File, error) {
 		_ = f.Close()
 		return nil, hardlinkError(p)
 	}
+	// The size being replaced is the size of the opened file, not the size it had when looked up.
+	currentSize := info.Size()
 	if flag&unix.O_TRUNC != 0 {
 		if err := f.Truncate(0); err != nil {
 			_ = f.Close()
@@ -774,6 +775,16 @@ func (r *Restricted) SpaceAvailableForDecompression(ctx context.Context, dir str
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if r.fs.hardlinked(info) {
+		return hardlinkError(file)
+	}
+	if !info.Mode().IsRegular() {
+		return notRegularError(file)
+	}
 	return r.fs.spaceForArchive(ctx, f, file)
 }
 

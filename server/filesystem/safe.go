@@ -491,10 +491,23 @@ func (fs *Filesystem) removeEntry(dirfd int, name, canonical string) error {
 		if err := unix.Unlinkat(dirfd, name, 0); err != nil {
 			return err
 		}
-		fs.unixFS.Add(-st.Size())
+		fs.unixFS.Add(-removedBytes(st))
 		return nil
 	}
 	return unix.Unlinkat(dirfd, name, 0)
+}
+
+// removedBytes returns the usage freed by removing the name described by st. A regular file
+// with other names (hard links) keeps its data, so removing one of its names frees nothing.
+// This is the same rule the unrestricted removal applies (see ufs freedBy).
+func removedBytes(st ufs.FileInfo) int64 {
+	if !st.Mode().IsRegular() {
+		return 0
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Nlink > 1 {
+		return 0
+	}
+	return st.Size()
 }
 
 // entryLevel returns the restriction on an entry, given its lstat. A symbolic link is restricted
@@ -610,29 +623,14 @@ func (fs *Filesystem) writeEntry(p string, rd io.Reader, size int64, mode ufs.Fi
 	if t.name == "." || t.isDir() {
 		return &Error{code: ErrCodeIsDirectory, resolved: p}
 	}
-
-	var currentSize int64
-	if t.exists() && t.st.Mode().IsRegular() {
-		currentSize = t.st.Size()
-	}
-	// Reserve the space for the write, so that writes happening at the same time cannot each use
-	// the space that is left. The reservation is released when the write finishes. A write of an
-	// unknown size reserves the space for each chunk as it is read instead.
-	var reserved, used int64
-	if size >= 0 {
-		if err := fs.reserveDisk(size - currentSize); err != nil {
-			return err
-		}
-		reserved = max(size-currentSize, 0)
-	}
-	defer func() { fs.releaseDisk(reserved, used) }()
-
 	if t.exists() && !t.st.Mode().IsRegular() {
 		if skipRestricted {
 			return nil
 		}
 		return notRegularError(p)
 	}
+
+	existed := t.exists()
 	f, err := t.open(unix.O_WRONLY|unix.O_CREAT|unix.O_NONBLOCK, uint32(mode.Perm()))
 	if err != nil {
 		return err
@@ -652,6 +650,27 @@ func (fs *Filesystem) writeEntry(p string, rd io.Reader, size int64, mode ufs.Fi
 		}
 		return hardlinkError(p)
 	}
+
+	// The size being replaced is the size of the file that was opened, not the size it had when
+	// it was looked up, since the path can change in between.
+	currentSize := info.Size()
+
+	// Reserve the space for the write, so that writes happening at the same time cannot each use
+	// the space that is left. The reservation is released when the write finishes. A write of an
+	// unknown size reserves the space for each chunk as it is read instead.
+	var reserved, used int64
+	if size >= 0 {
+		if err := fs.reserveDisk(size - currentSize); err != nil {
+			// Do not leave an empty file behind for a write that was refused.
+			if !existed {
+				_ = unix.Unlinkat(t.dirfd, t.name, 0)
+			}
+			return err
+		}
+		reserved = max(size-currentSize, 0)
+	}
+	defer func() { fs.releaseDisk(reserved, used) }()
+
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
@@ -667,7 +686,7 @@ func (fs *Filesystem) writeEntry(p string, rd io.Reader, size int64, mode ufs.Fi
 	default:
 		// Each chunk reserves its own space as it is written, so only the old contents are
 		// removed from the usage here.
-		n, err = copyWithQuota(fs, f, rd)
+		_, err = copyWithQuota(fs, f, rd)
 		fs.unixFS.Add(-currentSize)
 		used = 0
 	}

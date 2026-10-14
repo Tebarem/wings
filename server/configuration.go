@@ -107,7 +107,7 @@ func (r RegistryAuth) GoString() string {
 // full server configuration in its API responses, so the password must never be
 // written out this way. Unmarshalling still reads the real values sent by the Panel.
 func (r RegistryAuth) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
+	return json.Marshal(struct { //nolint:gosec // G117: the password is redacted below, never the real secret
 		Registry string `json:"registry"`
 		Username string `json:"username"`
 		Password string `json:"password"`

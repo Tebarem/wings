@@ -259,7 +259,14 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 		if opts.Restricted {
 			// The size is not known ahead of time, so each write is counted against the disk limit.
-			return wrapError(fs.writeEntry(p, reader, -1, 0o644, time.Time{}, true), opts.FileName)
+			if err := fs.writeEntry(p, reader, -1, 0o644, time.Time{}, true); err != nil {
+				// Remove the partial file, the same as an unrestricted extraction does.
+				if IsErrorCode(err, ErrCodeDiskSpace) {
+					_ = fs.Restricted().Delete(p)
+				}
+				return wrapError(err, opts.FileName)
+			}
+			return nil
 		}
 
 		// Write the file, counting each write against the disk limit. The file is
